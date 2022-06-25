@@ -83,7 +83,7 @@ parser.add_argument('--feat-dim', default=32, type=int,
                     help='feature dimension (default: 128)')
 parser.add_argument('--moco-m', default=0.999, type=float,
                     help='moco momentum of updating key encoder (default: 0.999)')
-parser.add_argument('--method', default='LTSB_ENC', type=str,
+parser.add_argument('--method', default='LTSB_CLS', type=str,
                     choices=['LTSB_CLS', 'LTSB_ENC'])
 parser.add_argument('--reload', default=None, type=str,
                     help='load supervised model')
@@ -92,7 +92,7 @@ parser.add_argument('--warmup_epochs', default=10, type=int,
 parser.add_argument('--num_classes', default=100, type=int,
                     help='num classes in dataset')
 
-parser.add_argument('--mark', default='CIFAR100_0.01_r32_cls', type=str,
+parser.add_argument('--mark', default='CIFAR100_0.01_r32_cls_1', type=str,
                     help='log dir')
 
 
