@@ -62,6 +62,8 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight-decay', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
+parser.add_argument('--cos', default=True, type=bool,
+                    help='use cosine lr schedule')
 parser.add_argument('-p', '--print-freq', default=350, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -364,7 +366,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    pbar = enumerate(train_loader)
+    if args.rank == 0:
+        pbar = tqdm(pbar, total=len(train_loader))
+    for i, (images, target) in pbar:
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -374,8 +379,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        features, labels, logits = model(im_q=images[0], im_k=images[1], labels=target)
-        loss = criterion(features, labels, logits)
+        q, k, p, logits, conf = model(im_q=images[0], im_k=images[1], target=target, epoch=epoch)
+        loss = criterion(q, k, p, logits, conf, target)
 
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
         losses.update(loss.item(), logits.size(0))
