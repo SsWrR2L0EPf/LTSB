@@ -1,4 +1,4 @@
-## Evading the Pitfalls of Simplicity Bias in Long-Tailed Image Classification via Self-Supervised Learning
+## Delving Deep into Simplicity Bias for Long-Tailed Image Recognition
 
 ```bash
 # To train long-tailed CIFAR-100 with imbalanced ratio of 100:
