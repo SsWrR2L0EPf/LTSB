@@ -3,7 +3,6 @@ import builtins
 import math
 import os
 
-os.environ['OPENBLAS_NUM_THREADS'] = '2'
 import random
 import shutil
 import time
@@ -30,6 +29,7 @@ import moco.builder
 import moco.loader
 from losses import LTSBLoss
 from utils import shot_acc
+from tqdm import tqdm
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -259,7 +259,7 @@ def main_worker(gpu, ngpus_per_node, args):
         else f'./imagenet_inat/data/ImageNet_LT/ImageNet_LT_test.txt'
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    augmentation_sim = [
+    augmentation_sim = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.0)  # not strengthened
@@ -269,11 +269,11 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize
-    ]
+    ])
 
     rgb_mean = (0.485, 0.456, 0.406)
     ra_params = dict(translate_const=int(224 * 0.45), img_mean=tuple([min(255, round(255 * x)) for x in rgb_mean]), )
-    augmentation_randnclsstack = [
+    augmentation_randnclsstack = transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.08, 1.)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomApply([
@@ -284,7 +284,7 @@ def main_worker(gpu, ngpus_per_node, args):
         rand_augment_transform('rand-n{}-m{}-mstd0.5'.format(args.randaug_n, args.randaug_m), ra_params),
         transforms.ToTensor(),
         normalize,
-    ]
+    ])
 
     val_transform = transforms.Compose([
         transforms.Resize(256),

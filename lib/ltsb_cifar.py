@@ -2,8 +2,9 @@ import argparse
 import builtins
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+#os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 import random
+import math
 import shutil
 import time
 import warnings
@@ -51,7 +52,7 @@ parser.add_argument('--imb-factor', type=float, default=0.01,
                     metavar='IF', help='imbalanced factor', dest='imb_factor')
 parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+parser.add_argument('--momentum', default=0.91, type=float, metavar='M',
                     help='momentum of SGD solver')
 parser.add_argument('--wd', '--weight-decay', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
@@ -72,7 +73,7 @@ parser.add_argument('--dist-backend', default='gloo', type=str,
                     help='distributed backend')
 parser.add_argument('--seed', default=68, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--gpu', default=None, type=int,
+parser.add_argument('--gpu', default='0', type=str,
                     help='GPU id to use.')
 parser.add_argument('--multiprocessing-distributed', default=True, type=bool,
                     help='Use multi-processing distributed training to launch '
@@ -92,25 +93,20 @@ parser.add_argument('--warmup_epochs', default=10, type=int,
 parser.add_argument('--num_classes', default=100, type=int,
                     help='num classes in dataset')
 
-parser.add_argument('--mark', default='CIFAR100_0.01_r32_cls_1', type=str,
+parser.add_argument('--mark', default='CIFAR100_0.01_r32_cls_2', type=str,
                     help='log dir')
 
 
 def main():
     args = parser.parse_args()
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     args.root_model = f'{args.root_path}/{args.dataset}/{args.mark}'
     os.makedirs(args.root_model, exist_ok=True)
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        os.environ['PYTHONHASHSEED'] = str(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.random.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
-
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
@@ -134,6 +130,13 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.random.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+
     args.gpu = gpu
 
     # suppress printing if not master
@@ -159,8 +162,7 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating model '{}'".format(args.arch))
     model = getattr(moco.builder, args.method)(
         getattr(resnet_cifar, args.arch),
-        args.feat_dim, args.moco_m, num_classes=args.num_classes)
-    print(model)
+        args.feat_dim, args.moco_m, num_classes=args.num_classes, K=1024)
 
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -261,7 +263,7 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
         ], p=0.8),
         transforms.RandomGrayscale(p=0.2),
-        transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+        transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.2),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
@@ -347,6 +349,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     # switch to train mode
     model.train()
+    l = len(train_loader)
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -356,9 +359,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         im_q = images[0].cuda(args.gpu, non_blocking=True)
         im_k = images[1].cuda(args.gpu, non_blocking=True)
         target = target.cuda(args.gpu, non_blocking=True)
-
-        q, k, p, logits, conf = model(im_q=im_q, im_k=im_k, target=target, epoch=epoch)
-        loss = criterion(q, k, p, logits, conf, target)
+        
+        e = epoch + i / l
+        m = 1. - 0.5 * (1. + math.cos(math.pi * e / args.epochs)) * (1. - args.moco_m)
+        logits, logits2, sim, targets_con = model(im_q=im_q, im_k=im_k, target=target, epoch=m)
+        loss = criterion(logits, logits2, sim, target, targets_con)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -417,6 +422,27 @@ def validate(val_loader, train_loader, model, criterion, args):
                                                                      .format(top1=top1, top5=top5))
 
     return top1.avg
+
+
+def split_normalization_params(model):
+    norm_classes = [nn.modules.batchnorm._BatchNorm, nn.LayerNorm, nn.GroupNorm]
+
+    for t in norm_classes:
+        if not issubclass(t, nn.Module):
+            raise ValueError(f"Class {t} is not a subclass of nn.Module.")
+
+    classes = tuple(norm_classes)
+
+    norm_params = []
+    other_params = []
+    for module in model.modules():
+        if next(module.children(), None):
+            other_params.extend(p for p in module.parameters(recurse=False) if p.requires_grad)
+        elif isinstance(module, classes):
+            norm_params.extend(p for p in module.parameters() if p.requires_grad)
+        else:
+            other_params.extend(p for p in module.parameters() if p.requires_grad)
+    return norm_params, other_params
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

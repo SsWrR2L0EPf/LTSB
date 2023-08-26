@@ -3,11 +3,14 @@ import builtins
 import math
 import os
 
+import torchvision.models
+
 import random
 import shutil
 import time
 import warnings
 import numpy as np
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -23,32 +26,31 @@ import torchvision.models as models
 import torch.nn.functional as F
 
 from randaugment import rand_augment_transform
-from dataset.inat import INaturalist
-from dataset.inat_moco import INaturalist_moco
-from losses import LTSBLoss
-from utils import shot_acc
+from dataset.places import PlacesLT
+from dataset.places_moco import PlacesLT_moco
 import moco.builder
 import moco.loader
-from tqdm import tqdm
+from losses import LTSBLoss
+from utils import shot_acc
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', default='inat', choices=['inat', 'imagenet'])
-parser.add_argument('--data', metavar='DIR', default='/data1/dataset/')
+parser.add_argument('--dataset', default='places', choices=['inat', 'imagenet', 'places'])
+parser.add_argument('--data', metavar='DIR', default='/disk/SSD3/sxh/PlacesLT/')
 parser.add_argument('--root_path', type=str, default='./data')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet152',
                     choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet50)')
-parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=200, type=int, metavar='N',
+parser.add_argument('--epochs', default=30, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -59,12 +61,12 @@ parser.add_argument('--schedule', default=[120, 160], nargs='*', type=int,
                     help='learning rate schedule (when to drop lr by 10x)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum of SGD solver')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+parser.add_argument('--wd', '--weight-decay', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
 parser.add_argument('--cos', default=True, type=bool,
                     help='use cosine lr schedule')
-parser.add_argument('-p', '--print-freq', default=950, type=int,
+parser.add_argument('-p', '--print-freq', default=350, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
@@ -80,13 +82,14 @@ parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 parser.add_argument('--seed', default=68, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--gpu', default=None, type=str,
+parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
 parser.add_argument('--multiprocessing-distributed', default=True, type=bool,
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+
 parser.add_argument('--feat-dim', default=128, type=int,
                     help='feature dimension (default: 128)')
 parser.add_argument('--moco-m', default=0.999, type=float,
@@ -95,21 +98,19 @@ parser.add_argument('--method', default='LTSB_CLS', type=str,
                     choices=['LTSB_CLS', 'LTSB_ENC'])
 parser.add_argument('--reload', default=None, type=str,
                     help='load supervised model')
-parser.add_argument('--warmup_epochs', default=10, type=int,
+parser.add_argument('--warmup_epochs', default=5, type=int,
                     help='warmup epochs')
 parser.add_argument('--randaug_m', default=10, type=int, help='randaug-m')
 parser.add_argument('--randaug_n', default=2, type=int, help='randaug-n')
-parser.add_argument('--num_classes', default=8142, type=int, help='num classes in dataset')
+parser.add_argument('--num_classes', default=365, type=int, help='num classes in dataset')
 
-parser.add_argument('--mark', default='inat_R50_cls', type=str,
+parser.add_argument('--mark', default='Places_R152_cls', type=str,
                     help='log dir')
-
 best_acc = 0
+
 
 def main():
     args = parser.parse_args()
-    if args.gpu is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     args.root_model = f'{args.root_path}/{args.dataset}/{args.mark}'
     os.makedirs(args.root_model, exist_ok=True)
 
@@ -145,6 +146,12 @@ def main():
         main_worker(args.gpu, ngpus_per_node, args)
 
 
+def disable_conv(model):
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            module.weight.requires_grad = False
+
+
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc
     args.gpu = gpu
@@ -174,6 +181,7 @@ def main_worker(gpu, ngpus_per_node, args):
     model = getattr(moco.builder, args.method)(
         models.__dict__[args.arch],
         args.feat_dim, args.moco_m, num_classes=args.num_classes)
+    print(model)
 
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -183,6 +191,16 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
+
+            disable_conv(model)
+            for module in model.encoder_q.layer4[-1].modules():
+                if isinstance(module, nn.Conv2d):
+                    module.weight.requires_grad = True
+            if hasattr(model, 'encoder_q2'):
+                for module in model.encoder_q2.layer4[-1].modules():
+                    if isinstance(module, nn.Conv2d):
+                        module.weight.requires_grad = True
+
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -252,15 +270,12 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
-    txt_train = f'./imagenet_inat/data/iNaturalist18/iNaturalist18_train.txt' if args.dataset == 'inat' \
-        else f'./imagenet_inat/data/ImageNet_LT/ImageNet_LT_train.txt'
+    txt_train = f'imagenet_inat/data/Places_LT/Places_LT_train.txt'
 
-    txt_test = f'./imagenet_inat/data/iNaturalist18/iNaturalist18_val.txt' if args.dataset == 'inat' \
-        else f'./imagenet_inat/data/ImageNet_LT/ImageNet_LT_test.txt'
+    txt_test = f'imagenet_inat/data/Places_LT/Places_LT_val.txt'
 
-    normalize = transforms.Normalize(mean=[0.466, 0.471, 0.380], std=[0.195, 0.194, 0.192])
-
-    augmentation_sim = transforms.Compose([
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    augmentation_sim = [
         transforms.RandomResizedCrop(224),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.0)  # not strengthened
@@ -270,21 +285,7 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize
-    ])
-
-    rgb_mean = (0.485, 0.456, 0.406)
-    ra_params = dict(translate_const=int(224 * 0.45), img_mean=tuple([min(255, round(255 * x)) for x in rgb_mean]), )
-
-    augmentation_randncls = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.0)
-        ], p=1.0),
-        rand_augment_transform('rand-n{}-m{}-mstd0.5'.format(args.randaug_n, args.randaug_m), ra_params),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    ]
 
     val_transform = transforms.Compose([
         transforms.Resize(256),
@@ -292,19 +293,14 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         normalize])
 
-    val_dataset = INaturalist(
+    val_dataset = PlacesLT(
         root=args.data,
         txt=txt_test,
-        transform=val_transform
-    )
+        transform=val_transform)
 
-    transform_train = [augmentation_randncls, augmentation_sim]
+    transform_train = [transforms.Compose(augmentation_sim), transforms.Compose(augmentation_sim)]
 
-    train_dataset = INaturalist_moco(
-        root=args.data,
-        txt=txt_train,
-        transform=transform_train
-    ) if args.dataset == 'inat' else ImageNetLT_moco(
+    train_dataset = PlacesLT_moco(
         root=args.data,
         txt=txt_train,
         transform=transform_train)
@@ -316,6 +312,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train_sampler = None
 
     criterion.cal_weight_for_classes(train_dataset.cls_num_list)
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
@@ -329,7 +326,6 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, train_loader, model, criterion_ce, args)
         return
 
-
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -337,23 +333,22 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
-        if epoch>160:
-            acc = validate(val_loader, train_loader, model, criterion_ce, args)
-            if acc > best_acc:
-                best_acc = acc
-                is_best = True
-            else:
-                is_best = False
-    
-            if not args.multiprocessing_distributed or \
-                    (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'arch': args.arch,
-                    'acc': acc,
-                    'state_dict': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                }, is_best=is_best, filename=f'{args.root_model}/moco_ckpt.pth.tar')
+        acc = validate(val_loader, train_loader, model, criterion_ce, args)
+        if acc > best_acc:
+            best_acc = acc
+            is_best = True
+        else:
+            is_best = False
+
+        if not args.multiprocessing_distributed or \
+                (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'acc': acc,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }, is_best=is_best, filename=f'{args.root_model}/moco_ckpt.pth.tar')
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -384,8 +379,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        logits, sim, targets_con = model(im_q=images[0], im_k=images[1], target=target, epoch=epoch)
-        loss = criterion(logits, sim, target, targets_con)
+        q, k, p, logits, conf = model(im_q=images[0], im_k=images[1], target=target, epoch=epoch)
+        loss = criterion(q, k, p, logits, conf, target)
 
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
         losses.update(loss.item(), logits.size(0))
@@ -417,7 +412,7 @@ def validate(val_loader, train_loader, model, criterion, args):
 
     # switch to evaluate mode
     model.eval()
-    total_logits = torch.empty((0, 8142)).cuda()
+    total_logits = torch.empty((0, 365)).cuda()
     total_labels = torch.empty(0, dtype=torch.long).cuda()
 
     with torch.no_grad():
@@ -448,6 +443,7 @@ def validate(val_loader, train_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i, args)
 
+        # TODO: this should also be done with the ProgressMeter
         open(args.root_model + "/" + args.mark + ".log", "a+").write(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}\n'
                                                                      .format(top1=top1, top5=top5))
 
