@@ -384,7 +384,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        logits, sim, targets_con = model(im_q=images[0], im_k=images[1], target=target, epoch=epoch)
+        e = epoch + i / l
+        m = 1. - 0.5 * (1. + math.cos(math.pi * e / args.epochs)) * (1. - args.moco_m)
+        logits, logits2, sim, targets_con = model(im_q=images[0], im_k=images[1], target=target, epoch=m)
         loss = criterion(logits, sim, target, targets_con)
 
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
